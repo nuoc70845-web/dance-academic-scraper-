@@ -27,13 +27,15 @@ jobs:
       run: python ./scraper.py
 
     # 关键步骤：把生成的数据库文件提交并推送回仓库
+    # 关键步骤：把生成的数据库文件提交并推送回仓库
     - name: Commit and Push Database Changes
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
         
-        # 检查是否有文件变动
-        git add academic_events.db
+        # 使用 -f 强制添加，无视任何 .gitignore 规则
+        git add -f academic_events.db
+        
         if git diff --staged --quiet; then
           echo "没有检测到数据库更新。"
         else
