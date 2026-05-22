@@ -8,12 +8,14 @@ from typing import Optional, List
 from google import genai
 from google.genai import types
 
+VALID_CATEGORIES = "学术讲座、舞剧信息、展演资讯"
+
 # ==================== 1. 定义预期的结构化 JSON 格式 ====================
 class AcademicEvent(BaseModel):
-    category: str = Field(description="分类，严格限制为：舞剧开票、学术讲座、期刊征稿、赛事通知、其他")
+    category: str = Field(description=f"分类，严格限制为：{VALID_CATEGORIES}")
     title: str = Field(description="活动、舞剧或讲座的具体完整名称")
-    date_time: Optional[str] = Field(description="核心时间，如讲座时间、开票时间或截稿日期")
-    location: Optional[str] = Field(description="地点（线上活动写明平台如腾讯会议及号，线下写明具体场馆或院校）")
+    date_time: Optional[str] = Field(default=None, description="核心时间，如讲座时间、演出时间、开票时间")
+    location: Optional[str] = Field(default=None, description="地点（线上活动写明平台如腾讯会议及号，线下写明具体场馆或院校）")
     summary: str = Field(description="50字以内的核心内容摘要，提炼关键干货")
 
 class EventList(BaseModel):
@@ -39,32 +41,59 @@ def init_database():
     conn.commit()
     conn.close()
 
-def save_to_database(json_str: str, source_url: str):
+def parse_model_json(json_str: str) -> dict:
+    """兼容模型偶尔返回 Markdown 代码块的情况。"""
+    cleaned = json_str.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
+    return json.loads(cleaned)
+
+def save_to_database(json_str: str, source_url: str) -> int:
     """解析 Gemini 返回的 JSON 字符串并存入 SQLite 数据库"""
     try:
-        data = json.loads(json_str)
+        data = parse_model_json(json_str)
+        events = data.get("events", [])
+
+        if not events:
+            print("模型返回成功，但没有识别到可入库的信息。")
+            print(f"模型原始返回前300字：{json_str[:300]}")
+            return 0
+
         conn = sqlite3.connect('academic_events.db')
         cursor = conn.cursor()
+        saved_count = 0
         
         # 遍历 JSON 中的事件列表并写入
-        for event in data.get("events", []):
+        for event in events:
+            title = (event.get("title") or "").strip()
+            if not title:
+                continue
+
+            before_count = conn.total_changes
             cursor.execute('''
                 INSERT OR IGNORE INTO academic_events (category, title, date, location, summary, url)
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (
                 event.get("category"),
-                event.get("title"),
+                title,
                 event.get("date_time"),
                 event.get("location"),
                 event.get("summary"),
                 source_url
             ))
+            if conn.total_changes > before_count:
+                saved_count += 1
             
         conn.commit()
         conn.close()
-        print("🎉 数据已成功同步至本地 SQLite 数据库 (academic_events.db)")
+        print(f"数据已同步至本地 SQLite 数据库：新增 {saved_count} 条，模型共识别 {len(events)} 条。")
+        return saved_count
     except Exception as e:
         print(f"数据库写入失败: {e}")
+        print(f"模型原始返回前500字：{json_str[:500] if json_str else '空'}")
+        return 0
 
 # ==================== 3. 核心处理函数 ====================
 def fetch_and_analyze_article(url: str, api_key: str):
@@ -88,7 +117,10 @@ def fetch_and_analyze_article(url: str, api_key: str):
         
         prompt = (
             "你是一个专业的艺术学术信息提取助手。请仔细阅读输入的网页文本，并结合附带的所有图片（通常为宣讲海报或演出信息图）。"
-            "提取出里面所有的学术讲座、舞剧开票或征稿信息。如果图片海报中的关键信息（如时间、地点）与网页文本不一致，请以图片海报上的准确信息为准。"
+            f"只提取属于以下三个板块的信息：{VALID_CATEGORIES}。"
+            "如果不是这三类，请不要入选。"
+            "如果图片海报中的关键信息（如时间、地点）与网页文本不一致，请以图片海报上的准确信息为准。"
+            "没有明确时间或地点时，可以写“待公布”，但不要编造。"
         )
         contents = [prompt, f"网页文本内容如下：\n{text_content}"]
         
@@ -125,6 +157,7 @@ def fetch_and_analyze_article(url: str, api_key: str):
         
         print("正在请求 Gemini API 进行多模态融合分析...")
         client = genai.Client(api_key=api_key)
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
         
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -133,7 +166,7 @@ def fetch_and_analyze_article(url: str, api_key: str):
         )
         
         response = client.models.generate_content(
-            model="gemini-3.5-flash",
+            model=model_name,
             contents=contents,
             config=config
         )
@@ -148,7 +181,9 @@ if __name__ == "__main__":
     # 初始化创建数据库
     init_database()
     
-    test_url = "https://mp.weixin.qq.com/s/UKwDIIvvBqc3hh-c0uvtIA"
+    default_url = "https://mp.weixin.qq.com/s/UKwDIIvvBqc3hh-c0uvtIA"
+    raw_urls = os.environ.get("ARTICLE_URLS", default_url)
+    article_urls = [url.strip() for url in raw_urls.replace("\n", ",").split(",") if url.strip()]
     
    # 优先从 GitHub Actions 环境变量读取密钥
     GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -164,4 +199,14 @@ if __name__ == "__main__":
     # -------------------------
 
     if GEMINI_API_KEY:
-        json_output = fetch_and_analyze_article(test_url, GEMINI_API_KEY)
+        total_saved = 0
+        for article_url in article_urls:
+            print(f"\n开始处理文章：{article_url}")
+            json_output = fetch_and_analyze_article(article_url, GEMINI_API_KEY)
+            if json_output:
+                print(f"模型返回前300字：{json_output[:300]}")
+                total_saved += save_to_database(json_output, article_url)
+            else:
+                print("本篇文章没有返回可保存的提取结果。")
+
+        print(f"\n本次运行完成，共新增 {total_saved} 条信息。")
