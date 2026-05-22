@@ -12,7 +12,7 @@ st.markdown("这里展示的是从公众号实时采集的学术活动信息。"
 def load_data():
     conn = sqlite3.connect('academic_events.db')
     # 查询所有数据并按时间倒序排列
-    df = pd.read_sql_query("SELECT * FROM events ORDER BY date DESC", conn)
+    df = pd.read_sql_query("SELECT * FROM academic_events ORDER BY date DESC", conn)
     conn.close()
     return df
 
