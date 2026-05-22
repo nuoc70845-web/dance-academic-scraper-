@@ -148,7 +148,7 @@ if __name__ == "__main__":
     # 初始化创建数据库
     init_database()
     
-    test_url = "https://mp.weixin.qq.com/s/fe8K-dM6s-mZkVUm4lcFRQ"
+    test_url = "https://mp.weixin.qq.com/s/UKwDIIvvBqc3hh-c0uvtIA"
     
    # 优先从 GitHub Actions 环境变量读取密钥
     GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
