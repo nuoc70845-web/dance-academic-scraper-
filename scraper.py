@@ -3,12 +3,21 @@ import sqlite3
 import json
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from google import genai
 from google.genai import types
 
 VALID_CATEGORIES = "学术讲座、舞剧信息、展演资讯"
+DEFAULT_WEBSITE_URLS = [
+    "http://www.shdancecenter.com",
+    "https://njbldjy.polyt.cn/#/",
+    "https://www.jsartcentre.org",
+]
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
 
 # ==================== 1. 定义预期的结构化 JSON 格式 ====================
 class AcademicEvent(BaseModel):
@@ -20,7 +29,6 @@ class AcademicEvent(BaseModel):
 
 class EventList(BaseModel):
     events: List[AcademicEvent] = Field(description="从文章文本和图片中提取出的所有事件列表")
-
 # ==================== 2. 数据库操作逻辑 ====================
 def init_database():
     """初始化数据库，创建学术活动表"""
@@ -94,42 +102,7 @@ def save_to_database(json_str: str, source_url: str) -> int:
         print(f"数据库写入失败: {e}")
         print(f"模型原始返回前500字：{json_str[:500] if json_str else '空'}")
         return 0
-
-# ==================== 3. 核心处理函数 ====================
-def fetch_and_analyze_article(url: str, api_key: str):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    proxies = {"http": None, "https": None}
-    
-    try:
-        print("正在下载微信公众号网页...")
-        response = requests.get(url, headers=headers, proxies=proxies, timeout=10)
-        response.raise_for_status()
-        response.encoding = 'utf-8'
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        content_node = soup.find('div', id='js_content')
-        if not content_node:
-            return None
-            
-        text_content = content_node.get_text(separator="\n", strip=True)
-        
-        prompt = (
-            "你是一个专业的艺术学术信息提取助手。请仔细阅读输入的网页文本，并结合附带的所有图片（通常为宣讲海报或演出信息图）。"
-            f"只提取属于以下三个板块的信息：{VALID_CATEGORIES}。"
-            "如果不是这三类，请不要入选。"
-            "如果图片海报中的关键信息（如时间、地点）与网页文本不一致，请以图片海报上的准确信息为准。"
-            "没有明确时间或地点时，可以写“待公布”，但不要编造。"
-        )
-        contents = [prompt, f"网页文本内容如下：\n{text_content}"]
-        
-        print("正在提取并下载海报图片...")
-        img_tags = content_node.find_all('img')
-        img_count = 0
-        MAX_IMAGES = 6  # 设定安全阀：最多只处理6张图片
-        
-        for img in img_tags:
+                for img in img_tags:
             if img_count >= MAX_IMAGES:
                 print(f"已达到图片数量上限 ({MAX_IMAGES}张)，跳过剩余排版图片以保障效率。")
                 break
@@ -140,7 +113,7 @@ def fetch_and_analyze_article(url: str, api_key: str):
                     if "wx_fmt=gif" in img_url:
                         continue
                         
-                    img_resp = requests.get(img_url, headers=headers, proxies=proxies, timeout=5)
+                    img_resp = requests.get(img_url, headers=HEADERS, proxies=proxies, timeout=5)
                     if img_resp.status_code == 200:
                         mime_type = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0]
                         if "image" in mime_type and "gif" not in mime_type:
@@ -156,19 +129,12 @@ def fetch_and_analyze_article(url: str, api_key: str):
         print(f"网页文本分析完毕。已加载 {img_count} 张图片。")
         
         print("正在请求 Gemini API 进行多模态融合分析...")
-        client = genai.Client(api_key=api_key)
-        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-        
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=EventList,
-            temperature=0.1
-        )
+        client = get_model_client(api_key)
         
         response = client.models.generate_content(
-            model=model_name,
+            model=get_model_name(),
             contents=contents,
-            config=config
+            config=get_model_config()
         )
         
         return response.text
@@ -176,14 +142,119 @@ def fetch_and_analyze_article(url: str, api_key: str):
     except Exception as e:
         print(f"程序运行异常: {str(e)}")
         return None
+
+def normalize_urls(raw_urls: str) -> List[str]:
+    return [url.strip() for url in raw_urls.replace("\n", ",").split(",") if url.strip()]
+
+def same_site(base_url: str, target_url: str) -> bool:
+    base_host = urlparse(base_url).netloc.replace("www.", "")
+    target_host = urlparse(target_url).netloc.replace("www.", "")
+    return bool(target_host) and base_host == target_host
+
+def extract_candidate_links(base_url: str, soup: BeautifulSoup, max_links: int = 30) -> List[dict]:
+    keywords = [
+        "舞", "演出", "展演", "剧目", "舞剧", "购票", "开票", "讲座",
+        "论坛", "活动", "艺术节", "工作坊", "大师课", "导赏"
+    ]
+    candidates = []
+    seen = set()
+
+    for link in soup.find_all("a"):
+        title = link.get_text(" ", strip=True)
+        href = link.get("href")
+        if not title or not href:
+            continue
+
+        full_url = urljoin(base_url, href)
+        if full_url in seen or not same_site(base_url, full_url):
+            continue
+
+        if any(keyword in title for keyword in keywords):
+            seen.add(full_url)
+            candidates.append({"title": title[:120], "url": full_url})
+
+        if len(candidates) >= max_links:
+            break
+
+    return candidates
+
+def fetch_page_text(url: str, max_chars: int = 5000) -> str:
+    response = requests.get(url, headers=HEADERS, timeout=12)
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding or "utf-8"
+    soup = BeautifulSoup(response.text, "html.parser")
+    for node in soup(["script", "style", "noscript"]):
+        node.decompose()
+    return soup.get_text("\n", strip=True)[:max_chars]
+
+def fetch_and_analyze_website(url: str, api_key: str):
+    try:
+        print(f"正在抓取网站入口：{url}")
+        response = requests.get(url, headers=HEADERS, timeout=12)
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or "utf-8"
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        for node in soup(["script", "style", "noscript"]):
+            node.decompose()
+
+        page_text = soup.get_text("\n", strip=True)[:6000]
+        candidates = extract_candidate_links(url, soup)
+        print(f"网站入口文本长度：{len(page_text)}；候选链接：{len(candidates)} 条。")
+
+        details = []
+        for item in candidates[:8]:
+            try:
+                detail_text = fetch_page_text(item["url"], max_chars=2500)
+                details.append(f"标题：{item['title']}\n链接：{item['url']}\n页面文本：{detail_text}")
+            except Exception as detail_error:
+                print(f"候选页面读取失败，已跳过：{item['url']} ({detail_error})")
+
+        candidate_text = "\n\n---\n\n".join(details)
+        prompt = (
+            "你是一个舞蹈学术信息筛选助手。请从下面的网站文本与候选页面中筛选信息。"
+            f"只保留以下三个板块：{VALID_CATEGORIES}。"
+            "舞剧、舞蹈演出、开票、购票归为“舞剧信息”；"
+            "艺术节、院团活动、舞蹈展演、工作坊可归为“展演资讯”；"
+            "学术讲座、论坛、研讨会、导赏讲座归为“学术讲座”。"
+            "不要收录无明确活动含义的导航、栏目名、广告语。"
+            "如果时间或地点不清楚，写“待公布”。"
+        )
+        contents = [
+            prompt,
+            f"网站入口：{url}\n\n入口页面文本：\n{page_text}\n\n候选页面：\n{candidate_text}"
+        ]
+
+        print("正在请求 Gemini API 进行网站信息筛选...")
+        client = get_model_client(api_key)
+        response = client.models.generate_content(
+            model=get_model_name(),
+            contents=contents,
+            config=get_model_config()
+        )
+        return response.text
+
+    except Exception as e:
+        print(f"网站采集异常：{url} ({e})")
+        return None
+
 # ==================== 4. 执行入口 ====================
 if __name__ == "__main__":
     # 初始化创建数据库
     init_database()
     
-    default_url = "https://mp.weixin.qq.com/s/UKwDIIvvBqc3hh-c0uvtIA"
-    raw_urls = os.environ.get("ARTICLE_URLS", default_url)
-    article_urls = [url.strip() for url in raw_urls.replace("\n", ",").split(",") if url.strip()]
+    raw_urls = os.environ.get("ARTICLE_URLS", "")
+    article_urls = normalize_urls(raw_urls)
+
+    raw_website_urls = os.environ.get("WEBSITE_URLS") or ",".join(DEFAULT_WEBSITE_URLS)
+    website_urls = normalize_urls(raw_website_urls)
+
+    if not article_urls and not website_urls:
+        print("本次没有收到公众号文章链接或网站入口链接，所以不会新增数据。")
+        print("请在 GitHub Actions 手动运行时填写 article_urls，或保留默认 website_urls。")
+        exit(1)
+
+    print(f"本次共收到 {len(article_urls)} 篇公众号文章链接、{len(website_urls)} 个网站入口。")
     
    # 优先从 GitHub Actions 环境变量读取密钥
     GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -208,5 +279,14 @@ if __name__ == "__main__":
                 total_saved += save_to_database(json_output, article_url)
             else:
                 print("本篇文章没有返回可保存的提取结果。")
+
+        for website_url in website_urls:
+            print(f"\n开始处理网站：{website_url}")
+            json_output = fetch_and_analyze_website(website_url, GEMINI_API_KEY)
+            if json_output:
+                print(f"模型返回前300字：{json_output[:300]}")
+                total_saved += save_to_database(json_output, website_url)
+            else:
+                print("本网站没有返回可保存的筛选结果。")
 
         print(f"\n本次运行完成，共新增 {total_saved} 条信息。")
