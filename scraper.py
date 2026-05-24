@@ -29,6 +29,7 @@ class AcademicEvent(BaseModel):
 
 class EventList(BaseModel):
     events: List[AcademicEvent] = Field(description="从文章文本和图片中提取出的所有事件列表")
+
 # ==================== 2. 数据库操作逻辑 ====================
 def init_database():
     """初始化数据库，创建学术活动表"""
@@ -102,7 +103,52 @@ def save_to_database(json_str: str, source_url: str) -> int:
         print(f"数据库写入失败: {e}")
         print(f"模型原始返回前500字：{json_str[:500] if json_str else '空'}")
         return 0
-                for img in img_tags:
+
+# ==================== 3. 核心处理函数 ====================
+def get_model_client(api_key: str):
+    return genai.Client(api_key=api_key)
+
+def get_model_config():
+    return types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=EventList,
+        temperature=0.1
+    )
+
+def get_model_name():
+    return os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+def fetch_and_analyze_article(url: str, api_key: str):
+    proxies = {"http": None, "https": None}
+    
+    try:
+        print("正在下载微信公众号网页...")
+        response = requests.get(url, headers=HEADERS, proxies=proxies, timeout=10)
+        response.raise_for_status()
+        response.encoding = 'utf-8'
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        content_node = soup.find('div', id='js_content')
+        if not content_node:
+            return None
+            
+        text_content = content_node.get_text(separator="\n", strip=True)
+        
+        prompt = (
+            "你是一个专业的艺术学术信息提取助手。请仔细阅读输入的网页文本，并结合附带的所有图片（通常为宣讲海报或演出信息图）。"
+            f"只提取属于以下三个板块的信息：{VALID_CATEGORIES}。"
+            "如果不是这三类，请不要入选。"
+            "如果图片海报中的关键信息（如时间、地点）与网页文本不一致，请以图片海报上的准确信息为准。"
+            "没有明确时间或地点时，可以写“待公布”，但不要编造。"
+        )
+        contents = [prompt, f"网页文本内容如下：\n{text_content}"]
+        
+        print("正在提取并下载海报图片...")
+        img_tags = content_node.find_all('img')
+        img_count = 0
+        MAX_IMAGES = 6  # 设定安全阀：最多只处理6张图片
+        
+        for img in img_tags:
             if img_count >= MAX_IMAGES:
                 print(f"已达到图片数量上限 ({MAX_IMAGES}张)，跳过剩余排版图片以保障效率。")
                 break
