@@ -15,8 +15,7 @@ from google.genai import types
 VALID_CATEGORIES = "学术讲座、舞剧信息、展演资讯"
 EXCLUDED_SHOW_TITLES = ["无名之辈", "叹春风"]
 TARGET_PERFORMANCE_CITIES = [
-    "上海", "南京", "苏州", "无锡", "常州", "南通", "扬州", "镇江",
-    "杭州", "宁波", "温州", "绍兴", "嘉兴", "湖州", "金华", "台州"
+    "上海", "南京", "杭州", "苏州", "宁波"
 ]
 CITY_TO_REGION = {
     "上海": "上海",
@@ -40,7 +39,6 @@ LOCATION_HINTS = {
     "丽水": "丽水", "衢州": "衢州",
 }
 DEFAULT_WEBSITE_URLS = [
-    "http://www.shdancecenter.co",
     "https://njbldjy.polyt.cn/#/",
     "https://www.jsartcentre.org",
     "https://www.nua.edu.cn",
@@ -689,13 +687,7 @@ def fetch_and_analyze_damai(search_url: str, api_key: str):
         if not candidates:
             return None
 
-        for candidate in candidates[:8]:
-            try:
-                detail_text = fetch_page_text(candidate["url"], max_chars=1800)
-                if detail_text:
-                    candidate["text"] = f"{candidate.get('text', '')}\n详情页：{detail_text}"[:2500]
-            except Exception as detail_error:
-                print(f"大麦详情页读取失败，继续使用搜索页信息：{candidate['url']} ({detail_error})")
+        candidates = candidates[:5]
 
         prompt = (
             "你是一个舞蹈演出数据整理助手。请只从下面的大麦候选演出中筛选舞剧、舞蹈、芭蕾相关信息。"
